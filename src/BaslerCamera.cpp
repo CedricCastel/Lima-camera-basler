@@ -52,6 +52,16 @@ const static std::string SN_PREFIX = "sn://";
 const static std::string UNAME_PREFIX = "uname://";
 
 //---------------------------
+//- bayer function
+//---------------------------
+static void copyBayerPixelsToFilterBuffer(const unsigned char * in_bayer_buffer, const int in_width, const int in_height, const int in_filter_scanline, uint8_t * in_filter_buffer);
+static void computeRBPixelsInFilterBuffer(uint8_t * in_out_filter_buffer, const int in_width, const int in_height, const int in_filter_scanline);
+static void computeMissingPixelsInFilterBuffer(uint8_t * in_out_filter_buffer, const int in_width, const int in_height, const int in_filter_scanline);
+static void copyFilterBufferToRgb24(const uint8_t * in_filter_buffer, const int in_width, const int in_height, const int in_filter_scanline, unsigned char * & out_rgb_buffer);
+static void computeBlurInFilterBuffer(uint8_t * & in_out_filter_buffer, const int in_width, const int in_height, unsigned char * out_rgb_buffer);
+static void convertBayerToRgb24(const unsigned char * in_bayer_buffer, const int in_width, const int in_height, unsigned char * & out_rgb_buffer);
+
+//---------------------------
 //- utility function
 //---------------------------
 static inline const char* _get_ip_addresse(const char *name_ip)
@@ -265,6 +275,12 @@ Camera::Camera(const std::string& camera_id,int packet_size,int receive_priority
             DEB_TRACE() << "Set ExposureAuto to Off";           
             Camera_->ExposureAuto.SetValue(ExposureAuto_Off);
         }
+
+	if (GenApi::IsAvailable(Camera_->TestImageSelector ))
+	{
+            DEB_TRACE() << "Set TestImage to Off";           
+            Camera_->TestImageSelector.SetValue(TestImageSelector_Off);	  
+	}
 	// Start with internal trigger
 	// Force cache variable to get trigger really initialized at first call
 	m_trigger_mode = ExtTrigSingle;
@@ -283,14 +299,15 @@ Camera::Camera(const std::string& camera_id,int packet_size,int receive_priority
         // Error handling
         THROW_HW_ERROR(Error) << e.GetDescription();
     }
-    if(m_color_flag) {
-      _allocColorBuffer();
-    }
-    else
-      {
-	for(int i = 0;i < NB_COLOR_BUFFER;++i)
-	  m_color_buffer[i] = NULL;
-      }
+
+    // if color camera video capability will be available
+    m_video_flag_mode = m_color_flag;
+    
+    // alloc a temporary buffer used for live mode and color camera
+    _allocTmpBuffer();
+
+    // CCA 
+    m_last_image = NULL;
 }
 
 //---------------------------
@@ -313,13 +330,15 @@ Camera::~Camera()
         DEB_TRACE() << "Close camera";
         delete Camera_;
         Camera_ = NULL;
-	if (m_video_flag_mode)
-	  for(int i = 0;i < NB_COLOR_BUFFER;++i)
+	for(int i = 0;i < NB_TMP_BUFFER;++i)
 #ifdef __unix
-	    free(m_color_buffer[i]);
+	  free(m_tmp_buffer[i]);
 #else
-	_aligned_free(m_color_buffer[i]);
+	  _aligned_free(m_tmp_buffer[i]);
 #endif
+
+        // CCA 
+        freeImage(m_last_image);
     }
     catch (GenICam::GenericException &e)
     {
@@ -333,63 +352,21 @@ void Camera::prepareAcq()
     DEB_MEMBER_FUNCT();
     m_image_number=0;
 
-    if(m_video_flag_mode)
-      return;			// Nothing to do if color camera
-
     try
     {
-	_freeStreamGrabber();
-        // Get the first stream grabber object of the selected camera
-        DEB_TRACE() << "Get the first stream grabber object of the selected camera";
-        StreamGrabber_ = new Camera_t::StreamGrabber_t(Camera_->GetStreamGrabber(0));
-	//Change priority to m_receive_priority
-	if(m_receive_priority > 0)
-	  {
-	    StreamGrabber_->ReceiveThreadPriorityOverride.SetValue(true);
-	    StreamGrabber_->ReceiveThreadPriority.SetValue(m_receive_priority);
-	  }
-        // Set Socket Buffer Size
-        DEB_TRACE() << "Set Socket Buffer Size";
-        if (m_socketBufferSize >0 )
-        {
-            StreamGrabber_->SocketBufferSize.SetValue(m_socketBufferSize);
-          }
-        // Open the stream grabber
-        DEB_TRACE() << "Open the stream grabber";
-        StreamGrabber_->Open();
-        if(!StreamGrabber_->IsOpen())
-        {
-            delete StreamGrabber_;
-            StreamGrabber_ = NULL;
-            THROW_HW_ERROR(Error) << "Unable to open the steam grabber!";
-        }
-        // We won't use image buffers greater than ImageSize
-        DEB_TRACE() << "We won't use image buffers greater than ImageSize";
-        StreamGrabber_->MaxBufferSize.SetValue((const size_t)ImageSize_);
+      _freeStreamGrabber();
+      // For video (color camera or B/W forced to video) use a small 2-frames Tmp buffer
+      // to not stop acq if some frames are missing but just return the last acquired
+      // for other modes the SoftBuffer is filled by Pylon Grabber, and an frame error will
+      // stop the acquisition
+      if(m_video_flag_mode || m_nb_frames == 0)
+	_initStreamGrabber(TmpBuffer);
+      else
+	_initStreamGrabber(SoftBuffer);
+      
 
-        StdBufferCbMgr& buffer_mgr = m_buffer_ctrl_obj.getBuffer();
-        // We won't queue more than c_nBuffers image buffers at a time
-        int nb_buffers;
-        buffer_mgr.getNbBuffers(nb_buffers);
-        DEB_TRACE() << "We'll queue " << nb_buffers << " image buffers";
-        StreamGrabber_->MaxNumBuffer.SetValue(nb_buffers);
-
-        // Allocate all resources for grabbing. Critical parameters like image
-        // size now must not be changed until FinishGrab() is called.
-        DEB_TRACE() << "Allocate all resources for grabbing, PrepareGrab";
-        StreamGrabber_->PrepareGrab();
-
-        // Put buffer into the grab queue for grabbing
-        DEB_TRACE() << "Put buffer into the grab queue for grabbing";
-        for(int i = 0;i < nb_buffers;++i)
-        {
-            void *ptr = buffer_mgr.getFrameBufferPtr(i);
-            // The registration returns a handle to be used for queuing the buffer.
-            StreamBufferHandle bufferId = StreamGrabber_->RegisterBuffer(ptr,(const size_t)ImageSize_);
-            StreamGrabber_->QueueBuffer(bufferId, NULL);
-        }
-	if(m_trigger_mode == IntTrigMult)
-	  _startAcq();
+      if(m_trigger_mode == IntTrigMult)
+	_startAcq();
     }
     catch (GenICam::GenericException &e)
     {
@@ -430,9 +407,6 @@ void Camera::_startAcq()
 {
   DEB_MEMBER_FUNCT();
 
-  if(m_video_flag_mode)
-    _initColorStreamGrabber();
-  
   Camera_->AcquisitionStart.Execute();
 
   //Start acqusition thread
@@ -506,26 +480,52 @@ void Camera::_freeStreamGrabber()
       StreamGrabber_ = NULL;         
     }
 }
-
-void Camera::_allocColorBuffer()
+void Camera::_forceVideoMode(bool force)
 {
   DEB_MEMBER_FUNCT();
-  for(int i = 0;i < NB_COLOR_BUFFER;++i)
+  m_video_flag_mode = force;
+  
+}
+void Camera::_allocTmpBuffer()
+{
+  DEB_MEMBER_FUNCT();
+  for(int i = 0;i < NB_TMP_BUFFER;++i)
     {
 #ifdef __unix
-      posix_memalign(&m_color_buffer[i],16,ImageSize_);
+      int ret=posix_memalign(&m_tmp_buffer[i],16,ImageSize_);
+      if (ret)
+	THROW_HW_ERROR(Error) << "posix_memalign(): request for aligned memory allocation failed";
 #else
-      m_color_buffer[i] = _aligned_malloc(ImageSize_,16);
+      m_tmp_buffer[i] = _aligned_malloc(ImageSize_,16);
+      if (m_tmp_buffer[i] == NULL)
+	THROW_HW_ERROR(Error) << "_aligned_malloc(): request for aligned memory allocation failed";	
 #endif
-      m_video_flag_mode = true;
     }
 }
 
-void Camera::_initColorStreamGrabber()
+void Camera::_initStreamGrabber(BufferMode mode)
 {
   DEB_MEMBER_FUNCT();
 
+  // Get the first stream grabber object of the selected camera
   StreamGrabber_ = new Camera_t::StreamGrabber_t(Camera_->GetStreamGrabber(0));
+  DEB_TRACE() << "Get the first stream grabber object of the selected camera";
+
+  //Change priority to m_receive_priority
+  if(m_receive_priority > 0)
+    {
+      StreamGrabber_->ReceiveThreadPriorityOverride.SetValue(true);
+      StreamGrabber_->ReceiveThreadPriority.SetValue(m_receive_priority);
+    }
+  // Set Socket Buffer Size
+  DEB_TRACE() << "Set Socket Buffer Size";
+  if (m_socketBufferSize >0 )
+    {
+      StreamGrabber_->SocketBufferSize.SetValue(m_socketBufferSize);
+    }
+  
+  // Open the stream grabber
+  DEB_TRACE() << "Open the stream grabber";
   StreamGrabber_->Open();
   if(!StreamGrabber_->IsOpen())
     {
@@ -533,15 +533,43 @@ void Camera::_initColorStreamGrabber()
       StreamGrabber_ = NULL;
       THROW_HW_ERROR(Error) << "Unable to open the steam grabber!";
     }
+  // We won't use image buffers greater than ImageSize
+  DEB_TRACE() << "We won't use image buffers greater than ImageSize";
   StreamGrabber_->MaxBufferSize.SetValue((const size_t)ImageSize_);
-  StreamGrabber_->MaxNumBuffer.SetValue(NB_COLOR_BUFFER);
-  StreamGrabber_->PrepareGrab();
 
-  for(int i = 0;i < NB_COLOR_BUFFER;++i)
+  // Allocate all resources for grabbing. Critical parameters like image
+  // size now must not be changed until FinishGrab() is called.
+  if (mode == TmpBuffer)
     {
-      StreamBufferHandle bufferId = StreamGrabber_->RegisterBuffer(m_color_buffer[i],
-								   (const size_t)ImageSize_);
-      StreamGrabber_->QueueBuffer(bufferId,NULL);
+      DEB_TRACE() << "We'll queue " << NB_TMP_BUFFER << " image buffers";
+      StreamGrabber_->MaxNumBuffer.SetValue(NB_TMP_BUFFER);
+      DEB_TRACE() << "Allocate all resources for grabbing, PrepareGrab";
+      StreamGrabber_->PrepareGrab();
+      
+      for(int i = 0;i < NB_TMP_BUFFER;++i)
+	{
+	  StreamBufferHandle bufferId = StreamGrabber_->RegisterBuffer(m_tmp_buffer[i],
+								       (const size_t)ImageSize_);
+	  StreamGrabber_->QueueBuffer(bufferId,NULL);
+	}
+    }
+  else // SoftBuffer
+    {
+      StdBufferCbMgr& buffer_mgr = m_buffer_ctrl_obj.getBuffer();
+      int nb_buffers;
+      buffer_mgr.getNbBuffers(nb_buffers);
+      DEB_TRACE() << "We'll queue " << nb_buffers << " image buffers";
+      StreamGrabber_->MaxNumBuffer.SetValue(nb_buffers);
+      DEB_TRACE() << "Allocate all resources for grabbing, PrepareGrab";
+      StreamGrabber_->PrepareGrab();
+      
+      for(int i = 0;i < nb_buffers;++i)
+	{
+	  void *ptr = buffer_mgr.getFrameBufferPtr(i);	  
+	  StreamBufferHandle bufferId = StreamGrabber_->RegisterBuffer(ptr,
+								       (const size_t)ImageSize_);
+	StreamGrabber_->QueueBuffer(bufferId,NULL);
+      }
     }
 }
 
@@ -606,12 +634,18 @@ void Camera::_AcqThread::threadFunction()
 				  {
 				    int nb_buffers;
 				    buffer_mgr.getNbBuffers(nb_buffers);
-				    if (!m_cam.m_nb_frames || 
+				    if (m_cam.m_nb_frames == 0 || 
 					m_cam.m_image_number < int(m_cam.m_nb_frames - nb_buffers))
 				      m_cam.StreamGrabber_->QueueBuffer(Result.Handle(),NULL);
                                 
 				    HwFrameInfoType frame_info;
 				    frame_info.acq_frame_nb = m_cam.m_image_number;
+				    // copy TmpBuffer frame to SoftBuffer frame room
+				    if (m_cam.m_nb_frames == 0)
+				      {
+					void *ptr = buffer_mgr.getFrameBufferPtr(m_cam.m_image_number);
+					memcpy(ptr, (void *)Result.Buffer(), m_cam.ImageSize_);
+				      }
 				    continueAcq = buffer_mgr.newFrameReady(frame_info);
 				    DEB_TRACE() << DEB_VAR1(continueAcq);
 				  }
@@ -648,6 +682,8 @@ void Camera::_AcqThread::threadFunction()
 								Result.GetSizeX(),
 								Result.GetSizeY(),
 								mode);
+
+                    m_cam.keepLastImage((char*)Result.Buffer(), Result.GetSizeX(), Result.GetSizeY(), mode);
 				  }
                                 ++m_cam.m_image_number;
                             }
@@ -1825,6 +1861,96 @@ void Camera::setFrameTransmissionDelay(int ftd)
     }
 }
 
+//--------------------------------------------------------
+//
+//-----------------------------------------------------
+void Camera::setAcquisitionFrameRateEnable(bool AFRE)
+{
+    DEB_MEMBER_FUNCT();
+    DEB_PARAM() << DEB_VAR1(AFRE);
+    try
+    {
+        Camera_->AcquisitionFrameRateEnable.SetValue(AFRE);
+    }
+    catch (GenICam::GenericException &e)
+    {
+        // Error handling
+        THROW_HW_ERROR(Error) << e.GetDescription();
+    }
+}
+
+//--------------------------------------------------------
+//
+//-----------------------------------------------------
+void Camera::getAcquisitionFrameRateEnable(bool& AFRE) const
+{
+    DEB_MEMBER_FUNCT();
+    DEB_PARAM() << DEB_VAR1(AFRE);
+    try
+    {
+        if (GenApi::IsAvailable(Camera_->AcquisitionFrameRateEnable))
+        {
+            AFRE  = Camera_->AcquisitionFrameRateEnable.GetValue();
+        }
+        else
+        {
+            AFRE = false;
+//			THROW_HW_ERROR(Error)<<"AcquisitionFrameRateEnable Parameter is not Available !";
+        }
+    }
+    catch (GenICam::GenericException &e)
+    {
+        // Error handling
+        THROW_HW_ERROR(Error) << e.GetDescription();
+    }
+        DEB_RETURN() << DEB_VAR1(AFRE);
+
+}
+//--------------------------------------------------------
+//
+//-----------------------------------------------------
+void Camera::setAcquisitionFrameRateAbs(int AFRA)
+{
+    DEB_MEMBER_FUNCT();
+    DEB_PARAM() << DEB_VAR1(AFRA);
+    try
+    {
+        Camera_->AcquisitionFrameRateAbs.SetValue(AFRA);
+    }
+    catch (GenICam::GenericException &e)
+    {
+        // Error handling
+        THROW_HW_ERROR(Error) << e.GetDescription();
+    }
+}
+
+//--------------------------------------------------------
+//
+//-----------------------------------------------------
+void Camera::getAcquisitionFrameRateAbs(int& AFRA) const
+{
+    DEB_MEMBER_FUNCT();
+    DEB_PARAM() << DEB_VAR1(AFRA);
+    try
+    {
+        if (GenApi::IsAvailable(Camera_->AcquisitionFrameRateAbs))
+        {
+        AFRA  = Camera_->AcquisitionFrameRateAbs.GetValue();
+        }
+        else
+        {
+            AFRA = false;
+//			THROW_HW_ERROR(Error)<<"AcquisitionFrameRateAbs Parameter is not Available !";
+        }
+    }
+    catch (GenICam::GenericException &e)
+    {
+        // Error handling
+        THROW_HW_ERROR(Error) << e.GetDescription();
+    }
+        DEB_RETURN() << DEB_VAR1(AFRA);
+
+}
 //---------------------------
 //- Camera::reset()
 //---------------------------
@@ -1993,3 +2119,641 @@ void Camera::getStatisticsFailedBufferCount(long& count)
 		count = -1;//Because Not valid when acquisition is stopped
 }
 //---------------------------    
+
+
+//-----------------------------------------------------
+//
+//-----------------------------------------------------
+void Camera::setTestImageSelector(TestImageSelector set)
+{
+    DEB_MEMBER_FUNCT();
+    try
+    {
+        Basler_GigECamera::TestImageSelectorEnums test =
+            static_cast<Basler_GigECamera::TestImageSelectorEnums>(set);
+
+        // If the parameter TestImage is available for this camera
+        if (GenApi::IsAvailable(Camera_->TestImageSelector))
+            Camera_->TestImageSelector.SetValue(test);
+    }
+    catch (GenICam::GenericException &e)
+    {
+        DEB_WARNING() << e.GetDescription();
+    }
+}
+
+//-----------------------------------------------------
+//
+//-----------------------------------------------------
+void Camera::getTestImageSelector(TestImageSelector& set) const
+{
+    DEB_MEMBER_FUNCT();
+    try
+    {
+        Basler_GigECamera::TestImageSelectorEnums test;
+
+        // If the parameter TestImage is available for this camera
+        if (GenApi::IsAvailable(Camera_->TestImageSelector))
+            test = Camera_->TestImageSelector.GetValue();
+
+        set = static_cast<TestImageSelector>(test);
+
+    }
+    catch (GenICam::GenericException &e)
+    {
+        DEB_WARNING() << e.GetDescription();
+    }
+}
+
+//-----------------------------------------------------
+//
+//-----------------------------------------------------
+void Camera::freeImage(unsigned char * & out_image)
+{
+    if(out_image)
+    {
+    #ifdef __unix
+        free(out_image);
+    #else
+        _aligned_free(out_image);
+    #endif
+
+        out_image = NULL;
+    }
+}
+
+//-----------------------------------------------------
+//
+//-----------------------------------------------------
+unsigned char * Camera::allocImage(size_t in_size_in_bytes)
+{
+    DEB_MEMBER_FUNCT();
+    unsigned char * result = NULL;
+
+#ifdef __unix
+    int ret=posix_memalign(reinterpret_cast<void**>(&result),32,in_size_in_bytes);
+    if (ret)
+        THROW_HW_ERROR(Error) << "posix_memalign(): request for aligned memory allocation failed";
+#else
+    result = _aligned_malloc(in_size_in_bytes,32);
+    if (result == NULL)
+        THROW_HW_ERROR(Error) << "_aligned_malloc(): request for aligned memory allocation failed";	
+#endif
+
+    return result;
+}
+
+//-----------------------------------------------------
+//
+//-----------------------------------------------------
+void Camera::keepLastImage(const char * in_buffer, uint32_t in_width, uint32_t in_height, VideoMode in_mode)
+{
+    DEB_MEMBER_FUNCT();
+    AutoMutex aLock(m_cond_last_image.mutex());
+
+    freeImage(m_last_image);
+
+    m_last_image_width  = in_width ;
+    m_last_image_height = in_height;
+
+    if((in_mode == RGB24) || (in_mode == BGR24))
+    {
+        m_last_image_mode = MODE_RGB24;
+        m_last_image_byte_mode = 3;
+        m_last_image = allocImage(in_width * in_height * m_last_image_byte_mode);
+
+        // RGB24
+        if(in_mode == RGB24)
+        {
+            memcpy(m_last_image, in_buffer, in_width * in_height * m_last_image_byte_mode);
+        }
+        // BGR24
+        else 
+        {
+	        const unsigned char * source = reinterpret_cast<const unsigned char *>(in_buffer);
+	        unsigned char * dest = m_last_image;
+
+	        for (int i = 0; i < in_height; i++)
+	        for (int j = 0; j < in_width ; j++)
+	        {
+		        *dest++ = *(source + 2); // B
+		        *dest++ = *(source + 1); // G
+		        *dest++ = *(source    ); // R
+                source += 3;
+	        }
+        }
+    }
+    else
+    if((in_mode == RGB32) || (in_mode == BGR32))
+    {
+        m_last_image_mode = MODE_RGB32;
+        m_last_image_byte_mode = 4;
+        m_last_image = allocImage(in_width * in_height * m_last_image_byte_mode);
+
+        // RGB32
+        if(in_mode == RGB32)
+        {
+            memcpy(m_last_image, in_buffer, in_width * in_height * m_last_image_byte_mode);
+        }
+        // BGR32
+        else 
+        {
+	        const unsigned char * source = reinterpret_cast<const unsigned char *>(in_buffer);
+	        unsigned char * dest = m_last_image;
+
+	        for (int i = 0; i < in_height; i++)
+	        for (int j = 0; j < in_width ; j++)
+	        {
+                *dest++ = 0; // alpha
+                *dest++ = *(source + 3); // B
+		        *dest++ = *(source + 2); // G
+		        *dest++ = *(source + 1); // R
+                source += 4;
+	        }
+        }
+    }
+    else
+    if(in_mode == Y8)
+    {
+        m_last_image_mode = MODE_GRAY8;
+        m_last_image_byte_mode = 1;
+        m_last_image = allocImage(in_width * in_height * m_last_image_byte_mode);
+
+        // Y8
+        memcpy(m_last_image, in_buffer, in_width * in_height);
+    }
+    else
+    if(in_mode == BAYER_BG8)
+    {
+        // convert to RGB
+	    unsigned char * rgb24_buffer = NULL;
+	    convertBayerToRgb24(reinterpret_cast<const unsigned char *>(in_buffer), in_width, in_height, rgb24_buffer);
+
+        if(rgb24_buffer)
+        {
+            m_last_image_mode      = MODE_RGB24;
+            m_last_image_byte_mode = 3;
+            m_last_image           = allocImage(in_width * in_height * m_last_image_byte_mode);
+
+            memcpy(m_last_image, rgb24_buffer, in_width * in_height * m_last_image_byte_mode);
+            delete [] rgb24_buffer;
+        }
+    }
+}
+
+//-----------------------------------------------------
+//
+//-----------------------------------------------------
+void Camera::getLastImage(unsigned char * & out_image, uint32_t & out_width, uint32_t & out_height, Camera::LastImageMode & out_mode)
+{
+    DEB_MEMBER_FUNCT();
+    AutoMutex aLock(m_cond_last_image.mutex());
+
+    // default values
+    out_image  = NULL;
+    out_width  = 0;
+    out_height = 0;
+
+    if(m_last_image)
+    {
+        out_width  = m_last_image_width ;
+        out_height = m_last_image_height;
+        out_mode   = m_last_image_mode  ;
+        out_image  = allocImage(out_width * out_height * m_last_image_byte_mode);
+
+        memcpy(out_image, m_last_image, m_last_image_width * m_last_image_height * m_last_image_byte_mode);
+    }
+}
+
+#define BAYER_ENABLE_R_PIXEL
+#define BAYER_ENABLE_G_PIXEL
+#define BAYER_ENABLE_B_PIXEL
+
+#define BAYER_ENABLE_RB_PROCESS
+#define BAYER_ENABLE_MISSING_PIXELS_PROCESS
+#define BAYER_ENABLE_BLUR_PROCESS
+
+///////////////////////////////
+void copyBayerPixelsToFilterBuffer(const unsigned char * in_bayer_buffer, const int in_width, const int in_height, const int in_filter_scanline, uint8_t * in_filter_buffer)
+{
+    const uint8_t * source = in_bayer_buffer; // jump the top border and the left border to find the real position of the pixel(0,0)
+    uint8_t * dest = in_filter_buffer + in_filter_scanline + 3; // jump the top border and the left border to find the real position of the pixel(0,0)
+
+    // compute the number of BG or GR groups in the line
+    int  column_groups_nb     = (in_width >> 1);
+    bool line_has_last_column = ((in_width %  2) == 1);
+
+    // copy the pixels groups 
+    int x;
+    int y = in_height;
+
+    for(;;)
+    {       
+        // new BG line
+        x = column_groups_nb;
+
+        do
+        {
+            // B 
+        #ifdef BAYER_ENABLE_B_PIXEL
+            *dest = *source++;
+        #else
+            source++;
+        #endif
+            dest += 4; // move to the good RGB position, +3 to next start of RGB group and +1 for G position
+
+            // G 
+        #ifdef BAYER_ENABLE_G_PIXEL
+            *dest = *source++;
+        #else
+            source++;
+        #endif
+            dest += 2; // move to the good RGB position, +3 to next start of RGB group and +1 for G position
+        }
+        while(--x);
+
+        // last pixel ?
+        if(line_has_last_column)
+        {
+            // B 
+        #ifdef BAYER_ENABLE_B_PIXEL
+            *dest = *source++;
+        #else
+            source++;
+        #endif
+            dest += 3; // move to the good RGB position
+        }
+
+        // last line ?
+        if(--y == 0)
+            break;
+
+        // preparing the next line treatment
+        dest += 6; // jump the right border of the current line and the left border of the next line to get the initial position in the next line
+
+        // new GR line
+        x = column_groups_nb;
+
+        do
+        {
+            // G 
+        #ifdef BAYER_ENABLE_G_PIXEL
+            *(dest+1) = *source++;
+        #else
+            source++;
+        #endif
+            dest += 5; // move to the good RGB position, +3 to next start of RGB group and +2 for R position
+
+            // R 
+        #ifdef BAYER_ENABLE_R_PIXEL
+            *dest = *source++;
+        #else
+            source++;
+        #endif
+            dest += 1; // move to the good RGB position, +1 to next start of RGB group
+        }
+        while(--x);
+
+        // last pixel ?
+        if(line_has_last_column)
+        {
+            // G 
+        #ifdef BAYER_ENABLE_G_PIXEL
+            *(dest+1) = *source++;
+        #else
+            source++;
+        #endif
+            dest += 3; // move to the good RGB position, +3 to next start of RGB group
+        }
+
+        // last line ?
+        if(--y == 0)
+            break;
+
+        // preparing the next line treatment
+        dest += 6; // jump the right border of the current line and the left border of the next line to get the initial position in the next line
+    }
+}
+
+///////////////////////////////
+// compute the B component of RGB(R) pixels 
+// compute the R component of RGB(B) pixels 
+
+void computeRBPixelsInFilterBuffer(uint8_t * in_out_filter_buffer, const int in_width, const int in_height, const int in_filter_scanline)
+{
+    uint8_t * dest = in_out_filter_buffer + in_filter_scanline + 3; // jump the top border and the left border to find the real position of the pixel(0,0)
+    uint8_t * previous_line_start;
+
+    // compute the number of B or R in a line
+    int line_nb_B_component =  (in_width >> 1) + (in_width %  2);
+    int line_nb_R_component =  (in_width >> 1);
+
+    // compute the offsets to get the corner pixels
+    int up_left_corner_offset    = -in_filter_scanline - 3; 
+    int up_right_corner_offset   = -in_filter_scanline + 3; 
+
+    // copy the pixels groups 
+    int x;
+    int y = in_height;
+
+    previous_line_start = dest;
+
+    for(;;)
+    {       
+        // new BG line, B pixel, so compute the R component
+        x = line_nb_B_component;
+
+        // shift to R component position
+        dest += 2;
+
+        do
+        {
+            *dest = (*(dest + up_left_corner_offset) + *(dest - up_left_corner_offset) + *(dest + up_right_corner_offset) + *(dest - up_right_corner_offset)) >> 2; // div by 4
+            dest += 6; // +3 to jump to start of RGB(G) and +3 for next start of RGB(B)
+        }
+        while(--x);
+
+        // last line ?
+        if(--y == 0)
+            break;
+
+        // preparing the next line treatment
+        previous_line_start += in_filter_scanline;
+
+        dest = previous_line_start + 3; // jumping the first RGB(G) to get the RGB(R) position
+
+        // new GR line, R pixel, so compute the B component
+        x = line_nb_R_component;
+
+        do
+        {
+            *dest = (*(dest + up_left_corner_offset) + *(dest - up_left_corner_offset) + *(dest + up_right_corner_offset) + *(dest - up_right_corner_offset)) >> 2; // div by 4
+            dest += 6; // +3 to jump to start of RGB(G) and +3 for next start of RGB(R)
+        }
+        while(--x);
+
+        // last line ?
+        if(--y == 0)
+            break;
+
+        // preparing the next line treatment
+        previous_line_start += in_filter_scanline;
+        dest = previous_line_start; // first RGB(B) position
+    }
+}
+
+///////////////////////////////
+
+// compute the R and B components of RGB(G) pixels 
+// compute the G component of RGB(B) and RGB(R) pixels 
+
+void computeMissingPixelsInFilterBuffer(uint8_t * in_out_filter_buffer, const int in_width, const int in_height, const int in_filter_scanline)
+{
+    uint8_t * dest = in_out_filter_buffer + in_filter_scanline + 3; // jump the top border and the left border to find the real position of the pixel(0,0)
+    
+    // compute the number of BG or GR groups in the line
+    int  column_groups_nb     = (in_width >> 1);
+    bool line_has_last_column = ((in_width %  2) == 1);
+
+    // compute the offsets to get the corner pixels
+    int up_offset    = -in_filter_scanline; 
+    int left_offset  = -3          ; 
+
+    // copy the pixels groups 
+    int x;
+    int y = in_height;
+
+    for(;;)
+    {       
+        // new BG line
+        x = column_groups_nb;
+
+        do
+        {
+            // B -> compute the G value
+            dest++; // move to the G position
+            *dest = (*(dest + up_offset) + *(dest - up_offset) + *(dest + left_offset) + *(dest - left_offset)) >> 2; // div by 4
+            dest += 2; // move to the next RGB position
+
+            // G -> compute the R and B values
+            *dest = (*(dest + up_offset) + *(dest - up_offset) + *(dest + left_offset) + *(dest - left_offset)) >> 2; // div by 4
+            dest+= 2;
+            *dest = (*(dest + up_offset) + *(dest - up_offset) + *(dest + left_offset) + *(dest - left_offset)) >> 2; // div by 4
+            dest++; // move to the next RGB position
+        }
+        while(--x);
+
+        // last pixel ?
+        if(line_has_last_column)
+        {
+            // B -> compute the G value
+            dest++; // move to the G position
+            *dest = (*(dest + up_offset) + *(dest - up_offset) + *(dest + left_offset) + *(dest - left_offset)) >> 2; // div by 4
+            dest += 2; // move to the next RGB position
+        }
+
+        // last line ?
+        if(--y == 0)
+            break;
+
+        // preparing the next line treatment
+        dest += 6; // jump the right border of the current line and the left border of the next line to get the initial position in the next line
+
+        // new GR line
+        x = column_groups_nb;
+
+        do
+        {
+            // G -> compute the R and B values
+            *dest = (*(dest + up_offset) + *(dest - up_offset) + *(dest + left_offset) + *(dest - left_offset)) >> 2; // div by 4
+            dest+= 2;
+            *dest = (*(dest + up_offset) + *(dest - up_offset) + *(dest + left_offset) + *(dest - left_offset)) >> 2; // div by 4
+            dest++; // move to the next RGB position
+
+            // R -> compute the G value
+            dest++; // move to the G position
+            *dest = (*(dest + up_offset) + *(dest - up_offset) + *(dest + left_offset) + *(dest - left_offset)) >> 2; // div by 4
+            dest += 2; // move to the next RGB position
+        }
+        while(--x);
+
+        // last pixel ?
+        if(line_has_last_column)
+        {
+            // G -> compute the R and B values
+            *dest = (*(dest + up_offset) + *(dest - up_offset) + *(dest + left_offset) + *(dest - left_offset)) >> 2; // div by 4
+            dest+= 2;
+            *dest = (*(dest + up_offset) + *(dest - up_offset) + *(dest + left_offset) + *(dest - left_offset)) >> 2; // div by 4
+            dest++; // move to the next RGB position
+        }
+
+        // last line ?
+        if(--y == 0)
+            break;
+
+        // preparing the next line treatment
+        dest += 6; // jump the right border of the current line and the left border of the next line to get the initial position in the next line
+    }
+}
+
+///////////////////////////////
+void copyFilterBufferToRgb24(const uint8_t * in_filter_buffer, const int in_width, const int in_height, const int in_filter_scanline, unsigned char * & out_rgb_buffer)
+{
+    const uint8_t * source        = in_filter_buffer + in_filter_scanline + 3; // jump the top border and the left border to find the real position of the pixel(0,0)
+    unsigned char * dest          = out_rgb_buffer;
+    const int       dest_scanline = in_width * 3;
+
+    int y = in_height;
+
+    do
+    {       
+        memcpy(dest, source, dest_scanline);
+        dest   += dest_scanline     ;
+        source += in_filter_scanline;
+    }
+    while(--y);
+}
+
+///////////////////////////////
+void computeBlurInFilterBuffer(uint8_t * & in_out_filter_buffer, const int in_width, const int in_height, unsigned char * out_rgb_buffer)
+{
+    const int filter_width    = in_width  + 2; // add left and right borders to avoid to process special cases
+    const int filter_height   = in_height + 2; // add top and bottom borders to avoid to process special cases
+    const int filter_scanline = filter_width * 3; // line size
+    const int dest_scanline   = in_width * 3;
+
+    uint8_t *       dest   = out_rgb_buffer; 
+    const uint8_t * source = in_out_filter_buffer + filter_scanline + 3; // jump the top border and the left border to find the real position of the pixel(0,0)
+
+    // compute the number of BG or GR groups in the line
+    int  column_groups_nb     = (in_width >> 1);
+    bool line_has_last_column = ((in_width %  2) == 1);
+
+    // compute the offsets to get the corner pixels
+    int up_left_corner_offset  = -filter_scanline - 3; 
+    int up_right_corner_offset = -filter_scanline + 3; 
+    int up_offset              = -filter_scanline; 
+    int left_offset            = -3; 
+
+    // copy the pixels groups 
+    int x;
+    int y = in_height;
+
+    #define COMPUTE_BLUR(d,s) *d = (((*s) << 2) + (*(s + left_offset) + *(s - left_offset) + *(s + up_offset) + *(s - up_offset))) >> 3
+
+    for(;;)
+    {       
+        // new BG line
+        x = column_groups_nb;
+
+        do
+        {
+            // B -> compute the B value
+            COMPUTE_BLUR(dest, source);
+
+            dest   += 4; // move to the G position
+            source += 4; // move to the G position
+
+            // G -> compute the G value
+            COMPUTE_BLUR(dest, source);
+
+            dest   += 2; // move to the next RGB position
+            source += 2; // move to the next RGB position
+        }
+        while(--x);
+
+        // last pixel ?
+        if(line_has_last_column)
+        {
+            // B -> compute the B value
+            COMPUTE_BLUR(dest, source);
+
+            dest   += 3; // move to the next RGB position
+            source += 3; // move to the next RGB position
+        }
+
+        // last line ?
+        if(--y == 0)
+            break;
+
+        // preparing the next line treatment
+        source += 6; // jump the right border of the current line and the left border of the next line to get the initial position in the next line
+
+        // new GR line
+        x = column_groups_nb;
+
+        do
+        {
+            dest   ++; // move to the G position
+            source ++; // move to the G position
+
+            // G -> compute the G value
+            COMPUTE_BLUR(dest, source);
+
+            dest   += 4; // move to the R position
+            source += 4; // move to the R position
+
+            COMPUTE_BLUR(dest, source);
+
+            dest   ++; // move to the next RGB position
+            source ++; // move to the next RGB position
+        }
+        while(--x);
+
+        // last pixel ?
+        if(line_has_last_column)
+        {
+            dest   ++; // move to the G position
+            source ++; // move to the G position
+
+            // G -> compute the G value
+            COMPUTE_BLUR(dest, source);
+
+            dest   += 2; // move to the next RGB position
+            source += 2; // move to the next RGB position
+        }
+
+        // last line ?
+        if(--y == 0)
+            break;
+
+        // preparing the next line treatment
+        source += 6; // jump the right border of the current line and the left border of the next line to get the initial position in the next line
+    }
+}
+
+///////////////////////////////
+void convertBayerToRgb24(const unsigned char * in_bayer_buffer, const int in_width, const int in_height, unsigned char * & out_rgb_buffer)
+{
+    if((in_width >= 2) && (in_height > 0))
+    {
+        // creating a temp buffer to process bilinear filtering
+        const int filter_width    = in_width     + 2; // add left and right borders to avoid to process special cases
+        const int filter_height   = in_height    + 2; // add top and bottom borders to avoid to process special cases
+        const int filter_scanline = filter_width * 3; // line size
+	
+        uint8_t * filter_buffer = new uint8_t[filter_scanline * filter_height];
+        memset(filter_buffer, 0, filter_scanline * filter_height);
+
+        copyBayerPixelsToFilterBuffer(in_bayer_buffer, in_width, in_height, filter_scanline, filter_buffer);
+
+    #ifdef BAYER_ENABLE_RB_PROCESS
+        computeRBPixelsInFilterBuffer(filter_buffer  , in_width, in_height, filter_scanline);
+    #endif
+
+    #ifdef BAYER_ENABLE_MISSING_PIXELS_PROCESS
+        computeMissingPixelsInFilterBuffer(filter_buffer  , in_width, in_height, filter_scanline);
+    #endif
+
+        // creating the final image in RGB color format
+        out_rgb_buffer = new unsigned char[in_width * in_height * 3];
+
+        copyFilterBufferToRgb24(filter_buffer  , in_width, in_height, filter_scanline, out_rgb_buffer);
+
+    #ifdef BAYER_ENABLE_BLUR_PROCESS
+        computeBlurInFilterBuffer(filter_buffer  , in_width, in_height, out_rgb_buffer);
+    #endif
+
+        delete [] filter_buffer;
+    }
+}

@@ -22,6 +22,9 @@
 #ifndef BASLERCAMERA_H
 #define BASLERCAMERA_H
 
+#include <stdlib.h>
+#include <limits>
+
 #if defined (__GNUC__) && (__GNUC__ == 3) && defined (__ELF__)
 #   define GENAPI_DECL __attribute__((visibility("default")))
 #   define GENAPI_DECL_ABSTRACT __attribute__((visibility("default")))
@@ -29,8 +32,7 @@
 
 #include <pylon/PylonIncludes.h>
 #include <pylon/gige/BaslerGigEDeviceInfo.h>
-#include <stdlib.h>
-#include <limits>
+
 #include "lima/HwMaxImageSizeCallback.h"
 #include "lima/HwBufferMgr.h"
 #include "lima/HwEventCtrlObj.h"
@@ -78,6 +80,14 @@ class LIBBASLER_API Camera
     friend class SyncCtrlObj;
  public:
 
+     // CCA
+    enum LastImageMode 
+    {
+        MODE_RGB24,
+        MODE_RGB32,
+        MODE_GRAY8,
+    };
+
     enum Status {
       Ready, Exposure, Readout, Latency, Fault
     };
@@ -99,6 +109,17 @@ class LIBBASLER_API Camera
         LevelLow=Basler_GigECamera::TriggerActivation_LevelLow
     };
 
+    enum TestImageSelector {
+      TestImage_Off=Basler_GigECamera::TestImageSelector_Off,
+      TestImage_1=Basler_GigECamera::TestImageSelector_Testimage1,
+      TestImage_2=Basler_GigECamera::TestImageSelector_Testimage2,
+      TestImage_3=Basler_GigECamera::TestImageSelector_Testimage3,
+      TestImage_4=Basler_GigECamera::TestImageSelector_Testimage4,
+      TestImage_5=Basler_GigECamera::TestImageSelector_Testimage5,
+      TestImage_6=Basler_GigECamera::TestImageSelector_Testimage6,
+      TestImage_7=Basler_GigECamera::TestImageSelector_Testimage7,
+    };
+    
     Camera(const std::string& camera_id,int packet_size = -1,int received_priority = 0);
     ~Camera();
 
@@ -189,22 +210,45 @@ class LIBBASLER_API Camera
     void setAcquisitionFrameCount(int AFC);
     void getAcquisitionFrameCount(int& AFC) const;
 
+    // -- change AcquisitionFrameRateEnable
+    void setAcquisitionFrameRateEnable(bool AFRE);
+    void getAcquisitionFrameRateEnable(bool& AFRE) const;
+
+    // -- change acq frame count
+    void setAcquisitionFrameRateAbs(int AFRA);
+    void getAcquisitionFrameRateAbs(int& AFRA) const;
+
     // -- Pylon buffers statistics
     void getStatisticsTotalBufferCount(long& count);    
     void getStatisticsFailedBufferCount(long& count);
-    
+
+    // -- Pylon test image selectors
+    void setTestImageSelector(TestImageSelector set);
+    void getTestImageSelector(TestImageSelector& set) const;
+
+    // CCA
+    void freeImage(unsigned char * & out_image);
+    void keepLastImage(const char * in_buffer, uint32_t in_width, uint32_t in_height, VideoMode in_mode);
+    void getLastImage(unsigned char * & out_image, uint32_t & out_width, uint32_t & out_height, Camera::LastImageMode & out_mode);
+
  private:
+    enum BufferMode {TmpBuffer, SoftBuffer};
     class _AcqThread;
     friend class _AcqThread;
     void _stopAcq(bool);
     void _setStatus(Camera::Status status,bool force);
     void _freeStreamGrabber();
-    void _allocColorBuffer();
-    void _initColorStreamGrabber();
+    void _allocTmpBuffer();
+    void _initStreamGrabber(BufferMode mode);
     void _startAcq();
     void _readTrigMode();
+    void _forceVideoMode(bool force);
 
-    static const int NB_COLOR_BUFFER = 2;
+    // CCA
+    unsigned char * allocImage(size_t in_size_in_bytes);
+
+    static const int NB_TMP_BUFFER = 2;
+    
     //- lima stuff
     SoftBufferCtrlObj		m_buffer_ctrl_obj;
     HwEventCtrlObj            m_event_ctrl_obj;
@@ -220,9 +264,9 @@ class LIBBASLER_API Camera
     int                         m_socketBufferSize;
     
     //- basler stuff 
-    string                      m_camera_id;
-    string                      m_detector_model;
-    string                      m_detector_type;
+    std::string                 m_camera_id;
+    std::string                 m_detector_model;
+    std::string                 m_detector_type;
     Size                        m_detector_size;
     
     //- Pylon stuff
@@ -237,12 +281,21 @@ class LIBBASLER_API Camera
     int                           m_receive_priority;
     bool			  m_color_flag;
     bool			  m_video_flag_mode;
-    void*			  m_color_buffer[NB_COLOR_BUFFER];
-    VideoCtrlObj*		  m_video;    
+    void*			  m_tmp_buffer[NB_TMP_BUFFER];
+    VideoCtrlObj*		  m_video;
     TrigMode			  m_trigger_mode;
+
+    // CCA
+    Cond                          m_cond_last_image     ;
+    unsigned char *               m_last_image          ;
+    LastImageMode                 m_last_image_mode     ;
+    unsigned char                 m_last_image_byte_mode;
+    uint32_t                      m_last_image_width    ;
+    uint32_t                      m_last_image_height   ;
 };
 } // namespace Basler
 } // namespace lima
 
 
 #endif // BASLERCAMERA_H
+
