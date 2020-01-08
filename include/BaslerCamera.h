@@ -80,14 +80,6 @@ class LIBBASLER_API Camera
     friend class SyncCtrlObj;
  public:
 
-     // CCA
-    enum LastImageMode 
-    {
-        MODE_RGB24,
-        MODE_RGB32,
-        MODE_GRAY8,
-    };
-
     enum Status {
       Ready, Exposure, Readout, Latency, Fault
     };
@@ -226,11 +218,6 @@ class LIBBASLER_API Camera
     void setTestImageSelector(TestImageSelector set);
     void getTestImageSelector(TestImageSelector& set) const;
 
-    // CCA
-    void freeImage(unsigned char * & out_image);
-    void keepLastImage(const char * in_buffer, uint32_t in_width, uint32_t in_height, VideoMode in_mode);
-    void getLastImage(unsigned char * & out_image, uint32_t & out_width, uint32_t & out_height, Camera::LastImageMode & out_mode);
-
  private:
     enum BufferMode {TmpBuffer, SoftBuffer};
     class _AcqThread;
@@ -244,11 +231,9 @@ class LIBBASLER_API Camera
     void _readTrigMode();
     void _forceVideoMode(bool force);
 
-    // CCA
-    unsigned char * allocImage(size_t in_size_in_bytes);
-
     static const int NB_TMP_BUFFER = 2;
     
+
     //- lima stuff
     SoftBufferCtrlObj		m_buffer_ctrl_obj;
     HwEventCtrlObj            m_event_ctrl_obj;
@@ -284,18 +269,9 @@ class LIBBASLER_API Camera
     void*			  m_tmp_buffer[NB_TMP_BUFFER];
     VideoCtrlObj*		  m_video;
     TrigMode			  m_trigger_mode;
-
-    // CCA
-    Cond                          m_cond_last_image     ;
-    unsigned char *               m_last_image          ;
-    LastImageMode                 m_last_image_mode     ;
-    unsigned char                 m_last_image_byte_mode;
-    uint32_t                      m_last_image_width    ;
-    uint32_t                      m_last_image_height   ;
 };
 } // namespace Basler
 } // namespace lima
 
 
 #endif // BASLERCAMERA_H
-
